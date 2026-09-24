@@ -6,6 +6,20 @@ either from `--label` / `--enforcement` applied across the list, or per host fro
 the workloads file itself. The file format it reads is the one its backups are
 written in, so a backup can be fed straight back in to restore what it recorded.
 
+## Prerequisites
+
+Set up the following on the PCE before you use the script:
+
+- **Create and provision a quarantine policy for each quarantine level.** A
+  workload is only isolated once a provisioned policy acts on its quarantine
+  label (for example `Q-Level-1`). If no policy uses that label, the workload
+  gets the label but its traffic does not change. The quarantine labels must
+  also exist already, because the script never creates labels.
+- **The script only assigns quarantine levels to workloads.** It adds or removes
+  the quarantine label on the workloads you list, and can also set their
+  enforcement mode. It does not create, change or provision labels, rulesets or
+  rules. Build those in the PCE first.
+
 ## Quickstart
 
 ```bash
