@@ -1,9 +1,15 @@
 import argparse
+import asyncio
 import csv
+import gzip
+import logging
+import logging.handlers
 import os
 import re
 import requests
+import shutil
 import sys
+import time
 import yaml
 from datetime import datetime
 
@@ -163,66 +169,357 @@ def configure_pce(name=None, config_path='config.yaml'):
     return name
 
 
-# The PCE caps an unqualified GET /workloads at a few hundred results, which
-# would silently hide workloads on a large estate, so ask for a high ceiling and
-# check the total the PCE reports back.
-WORKLOAD_FETCH_LIMIT = 100000
+# A synchronous GET on a collection returns at most this many objects. Anything
+# larger is fetched another way, see fetch_workloads_async().
+SYNC_PAGE_SIZE = 500
 
-# Enforcement modes the PCE accepts, loosest to strictest.
-ENFORCEMENT_MODES = ('idle', 'visibility_only', 'selective', 'full')
+# On an estate too large for one page, hostnames are looked up one by one
+# rather than downloading every workload the PCE holds, provided there are no
+# more than HOSTNAME_LOOKUP_LIMIT of them and they come to no more than
+# HOSTNAME_LOOKUP_FRACTION of the estate. Past either, one download is cheaper
+# than that many calls.
+HOSTNAME_LOOKUP_LIMIT = 999
+HOSTNAME_LOOKUP_FRACTION = 0.1
 
-# The PCE accepts at most 1000 workloads per bulk_update call.
-BULK_UPDATE_LIMIT = 1000
+# How many requests are in flight to the PCE at once.
+MAX_CONCURRENT_REQUESTS = 8
 
-# Long listings are truncated to this many lines; the tables above them already
-# carry the detail.
-MAX_LISTED = 20
+# (connect, read) seconds. A bulk_update of 1000 workloads and the download of
+# a large collection can both take a while to answer.
+REQUEST_TIMEOUT = (10, 300)
+
+# Throttling and gateway errors are retried, backing off between attempts.
+RETRY_STATUSES = (429, 502, 503, 504)
+MAX_ATTEMPTS = 5
+MAX_RETRY_DELAY = 30
+
+# How long to wait for the PCE to finish an async collection job.
+JOB_TIMEOUT = 900
+
+# --debug writes every API call and every workload update here.
+LOG_FILE = os.path.splitext(os.path.basename(__file__))[0] + '.log'
+
+# Once the log reaches this size it is archived and a fresh one started.
+LOG_MAX_BYTES = 10 * 1024 * 1024
+
+# How many numbered logs --log-rotate keeps when no count is given.
+LOG_ROTATE_DEFAULT = 5
+
+log = logging.getLogger('quarantine_workloads')
+log.addHandler(logging.NullHandler())
 
 
-def fetch_workloads():
-    workloads_url = f'{base_url}/orgs/{org}/workloads'
-    response = requests.get(
-        workloads_url,
-        auth=auth,
-        verify=cert_path,
-        params={'max_results': WORKLOAD_FETCH_LIMIT},
-    )
+class ArchivingFileHandler(logging.handlers.RotatingFileHandler):
+    """A log file that, on reaching maxBytes, is compressed to
+    <name>.<yyyymmdd-hhmmss>.log.gz beside it and started afresh. Archives are
+    never overwritten or deleted."""
+
+    def doRollover(self):
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        base, extension = os.path.splitext(self.baseFilename)
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        archive = f'{base}.{stamp}{extension}.gz'
+        counter = 1
+        while os.path.exists(archive):
+            archive = f'{base}.{stamp}-{counter}{extension}.gz'
+            counter += 1
+
+        with open(self.baseFilename, 'rb') as source, \
+                gzip.open(archive, 'wb') as target:
+            shutil.copyfileobj(source, target)
+        os.remove(self.baseFilename)
+
+        self.stream = self._open()
+
+
+class PCEError(Exception):
+    """The PCE refused a request, or answered with something unusable."""
+
+
+def setup_debug_log(path=LOG_FILE, rotate=None):
+    """Send debug records to the log file. Without --debug nothing is logged.
+
+    A full log is archived to a timestamped .gz. With rotate, the log is
+    instead shifted along <name>.log.1, .2, ... keeping that many, .1 being the
+    most recent: once at the start of the run, so each run has a log to itself,
+    and again whenever it fills up.
+    """
+    if rotate:
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=LOG_MAX_BYTES, backupCount=rotate)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            handler.doRollover()
+    else:
+        handler = ArchivingFileHandler(path, maxBytes=LOG_MAX_BYTES)
+    handler.setFormatter(
+        logging.Formatter('%(asctime)s %(levelname)-5s %(message)s'))
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    log.debug('=' * 72)
+    log.debug('run started: %s', ' '.join(sys.argv))
+    return path
+
+
+_session = None
+
+
+def get_session():
+    # One session for the whole run, so the TLS connections to the PCE are
+    # reused instead of being renegotiated for every call.
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=MAX_CONCURRENT_REQUESTS,
+            pool_maxsize=MAX_CONCURRENT_REQUESTS,
+        )
+        _session.mount('https://', adapter)
+        _session.mount('http://', adapter)
+    return _session
+
+
+def api_url(href):
+    """Full URL for an href the PCE hands back, e.g. /orgs/1/jobs/<id>."""
+    if href.startswith(('http://', 'https://')):
+        return href
+    if href.startswith(API_PATH + '/'):
+        href = href[len(API_PATH):]
+    return f'{base_url}{href}'
+
+
+def retry_delay(response, fallback):
+    value = (response.headers.get('Retry-After') or '').strip()
+    if value.isdigit():
+        return min(int(value), MAX_RETRY_DELAY)
+    return fallback
+
+
+def api_request(method, url, retry_statuses=RETRY_STATUSES, **kwargs):
+    """One call to the PCE, retried when it is throttled or drops the
+    connection. Every attempt is written to the debug log; credentials never
+    are."""
+    session = get_session()
+    body = kwargs.get('json')
+    detail = ''
+    if kwargs.get('params'):
+        detail += f" params={kwargs['params']}"
+    if isinstance(body, list):
+        detail += f' items={len(body)}'
+    elif body is not None:
+        detail += f' body={body}'
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        backoff = min(2 ** (attempt - 1), MAX_RETRY_DELAY)
+        started = time.monotonic()
+        try:
+            response = session.request(
+                method, url, auth=auth, verify=cert_path,
+                timeout=REQUEST_TIMEOUT, **kwargs)
+        except requests.exceptions.SSLError:
+            # A certificate problem will not fix itself on a retry.
+            raise
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            log.debug('%s %s%s -> %s after %.2fs (attempt %d/%d)',
+                      method, url, detail, type(exc).__name__,
+                      time.monotonic() - started, attempt, MAX_ATTEMPTS)
+            if attempt == MAX_ATTEMPTS:
+                raise
+            time.sleep(backoff)
+            continue
+
+        log.debug('%s %s%s -> %d in %.2fs, %d bytes (attempt %d/%d)',
+                  method, url, detail, response.status_code,
+                  time.monotonic() - started, len(response.content),
+                  attempt, MAX_ATTEMPTS)
+        if response.status_code in retry_statuses and attempt < MAX_ATTEMPTS:
+            time.sleep(retry_delay(response, backoff))
+            continue
+        return response
+
+
+async def api_call(limiter, method, url, **kwargs):
+    """api_request() off the event loop, with limiter capping how many calls
+    are in flight at once."""
+    get_session()
+    async with limiter:
+        return await asyncio.to_thread(api_request, method, url, **kwargs)
+
+
+def run_async(work):
+    """Run work(limiter) to completion on a fresh event loop."""
+    async def runner():
+        return await work(asyncio.Semaphore(MAX_CONCURRENT_REQUESTS))
+    return asyncio.run(runner())
+
+
+async def fetch_page(limiter, resource, params=None):
+    """One synchronous GET of a collection.
+
+    Returns (items, truncated, matched), where matched is how many objects the
+    PCE says answer the query, or None if it does not say.
+    """
+    response = await api_call(
+        limiter, 'GET', f'{base_url}/orgs/{org}/{resource}',
+        params={**(params or {}), 'max_results': SYNC_PAGE_SIZE})
 
     if response.status_code != 200:
-        print(f"Failed to fetch workloads: {response.status_code}")
-        print(response.text)
-        raise SystemExit(1)
+        raise PCEError(
+            f"Failed to fetch {resource}: {response.status_code}\n{response.text}")
 
-    workloads = response.json()
+    items = response.json()
 
-    # X-Total-Count is what the PCE holds; a smaller list means it truncated.
-    total = response.headers.get('X-Total-Count')
-    if total and total.isdigit() and int(total) > len(workloads):
-        print(f"Warning: the PCE reports {total} workloads but returned "
-              f"{len(workloads)}. Raise WORKLOAD_FETCH_LIMIT "
-              f"(currently {WORKLOAD_FETCH_LIMIT}).")
+    # X-Matched-Count is how many objects answer this query, and X-Total-Count
+    # how many the PCE holds in all; the two differ once a filter is applied.
+    # A list shorter than the matched count means the PCE truncated it.
+    total = (response.headers.get('X-Matched-Count')
+             or response.headers.get('X-Total-Count'))
+    if total and total.isdigit():
+        return items, int(total) > len(items), int(total)
+    return items, len(items) >= SYNC_PAGE_SIZE, None
 
-    return workloads
+
+async def fetch_collection_job(limiter, resource):
+    """Fetch a whole collection through the PCE's async job API.
+
+    "Prefer: respond-async" makes the PCE answer 202 with the location of a
+    job, build the collection in the background, and leave it as a datafile to
+    download. Unlike a synchronous GET, it is not capped.
+    """
+    response = await api_call(
+        limiter, 'GET', f'{base_url}/orgs/{org}/{resource}',
+        headers={'Prefer': 'respond-async'})
+
+    # A PCE that ignores the header answers with the collection itself.
+    if response.status_code == 200:
+        return response.json()
+    location = response.headers.get('Location')
+    if response.status_code != 202 or not location:
+        raise PCEError(
+            f"Failed to fetch {resource}: {response.status_code}\n{response.text}")
+
+    job_url = api_url(location)
+    delay = retry_delay(response, 1)
+    deadline = time.monotonic() + JOB_TIMEOUT
+    while True:
+        await asyncio.sleep(delay)
+        response = await api_call(limiter, 'GET', job_url)
+        if response.status_code != 200:
+            raise PCEError(
+                f"Failed to fetch {resource}: job poll returned "
+                f"{response.status_code}\n{response.text}")
+        job = response.json()
+        status = job.get('status')
+        log.debug('%s job %s: %s', resource, location, status)
+        if status in ('done', 'completed'):
+            break
+        if status not in ('pending', 'queued', 'running'):
+            raise PCEError(f"Failed to fetch {resource}: job ended as {status}")
+        if time.monotonic() > deadline:
+            raise PCEError(
+                f"Failed to fetch {resource}: job still {status} after "
+                f"{JOB_TIMEOUT}s")
+        delay = min(delay * 1.5, 10)
+
+    result = (job.get('result') or {}).get('href')
+    if not result:
+        raise PCEError(f"Failed to fetch {resource}: job finished with no result")
+    response = await api_call(limiter, 'GET', api_url(result))
+    if response.status_code != 200:
+        raise PCEError(
+            f"Failed to fetch {resource}: {response.status_code}\n{response.text}")
+    return response.json()
+
+
+async def fetch_workloads_async(limiter, hostnames=None):
+    """Fetch the workloads needed to resolve hostnames, the cheapest way.
+
+    A small estate fits in one synchronous page. Past that, a hostname list
+    that is short, and a small share of the estate, is looked up host by host,
+    concurrently; anything else pulls the whole collection through an async
+    job.
+    """
+    workloads, truncated, estate = await fetch_page(limiter, 'workloads')
+    if not truncated:
+        return workloads
+
+    lookup = bool(hostnames) and len(hostnames) <= HOSTNAME_LOOKUP_LIMIT
+    if lookup and estate is not None:
+        lookup = len(hostnames) <= estate * HOSTNAME_LOOKUP_FRACTION
+    log.debug('%s workload(s) on the PCE, %d hostname(s) wanted: %s',
+              estate if estate is not None else 'unknown number of',
+              len(hostnames or ()),
+              'looking each up' if lookup else 'downloading the collection')
+
+    if lookup:
+        # The hostname filter matches substrings, so each lookup can return
+        # neighbours as well; match_workloads() keeps only the exact names.
+        pages = await asyncio.gather(*(
+            fetch_page(limiter, 'workloads', {'hostname': hostname})
+            for hostname in hostnames
+        ))
+        if not any(cut for _, cut, _ in pages):
+            by_href = {}
+            for page, _, _ in pages:
+                for workload in page:
+                    by_href[workload.get('href')] = workload
+            return list(by_href.values())
+        # A name vague enough to overflow a page could hide its exact match.
+        log.debug('a hostname lookup overflowed a page, downloading the '
+                  'collection instead')
+
+    return await fetch_collection_job(limiter, 'workloads')
+
+
+def fetch_workloads(hostnames=None, with_labels=False):
+    """Fetch workloads, and with_labels the PCE's label list alongside them."""
+    async def work(limiter):
+        tasks = [fetch_workloads_async(limiter, hostnames)]
+        if with_labels:
+            tasks.append(fetch_labels_async(limiter))
+        return (await asyncio.gather(*tasks))[0]
+
+    return run_async(work)
 
 
 _LABELS_CACHE = None
 
 
-def fetch_labels():
+async def fetch_labels_async(limiter):
     global _LABELS_CACHE
-    if _LABELS_CACHE is not None:
-        return _LABELS_CACHE
-
-    labels_url = f'{base_url}/orgs/{org}/labels'
-    response = requests.get(labels_url, auth=auth, verify=cert_path)
-
-    if response.status_code != 200:
-        print(f"Failed to fetch labels: {response.status_code}")
-        print(response.text)
-        raise SystemExit(1)
-
-    _LABELS_CACHE = response.json()
+    if _LABELS_CACHE is None:
+        labels, truncated, _ = await fetch_page(limiter, 'labels')
+        if truncated:
+            labels = await fetch_collection_job(limiter, 'labels')
+        _LABELS_CACHE = labels
     return _LABELS_CACHE
+
+
+def fetch_labels():
+    if _LABELS_CACHE is None:
+        run_async(fetch_labels_async)
+    return _LABELS_CACHE
+
+
+# Enforcement modes the PCE accepts, loosest to strictest.
+ENFORCEMENT_MODES = ('idle', 'visibility_only', 'selective', 'full')
+
+# The PCE accepts at most 1000 workloads per bulk_update call. --batch-size
+# lowers it for a PCE that cannot get through that many before timing out.
+BULK_UPDATE_LIMIT = 1000
+
+# A batch the PCE gives up on (a 5xx, typically its own request timeout) is
+# cut into this many pieces and resent, and later batches start at that size.
+# From then on updates go one at a time: a PCE that is already struggling
+# answers concurrent updates with more 5xx, not more throughput.
+BATCH_SPLIT = 4
+
+# Long listings are truncated to this many lines; the tables above them already
+# carry the detail.
+MAX_LISTED = 20
 
 
 def label_dict(workload):
@@ -704,26 +1001,21 @@ def print_label_diff(changes, action):
                       f"with the same change")
             return
 
-        if mode_changing:
-            headers = ('Hostname', 'Current Labels', 'New Labels',
-                       'Enforcement', 'New Enforcement')
-            rows = [
-                (c['hostname'],
-                 format_labels(c['current_labels']),
-                 format_labels(c['desired_labels']),
-                 c['current_mode'],
-                 c['desired_mode'] if c['desired_mode'] != c['current_mode'] else '-')
-                for c in shown
-            ]
-        else:
-            headers = ('Hostname', 'Current Labels', 'New Labels')
-            rows = [
-                (c['hostname'],
-                 format_labels(c['current_labels']),
-                 format_labels(c['desired_labels']))
-                for c in shown
-            ]
+        # The enforcement mode is always shown, changing or not, so the
+        # preview states where every workload ends up.
+        headers = ('Hostname', 'Current Labels', 'New Labels',
+                   'Enforcement', 'New Enforcement')
+        rows = [
+            (c['hostname'],
+             format_labels(c['current_labels']),
+             format_labels(c['desired_labels']),
+             c['current_mode'],
+             c['desired_mode'])
+            for c in shown
+        ]
         print_table(headers, rows)
+        if not mode_changing:
+            print("Enforcement modes are unchanged.")
         if len(changes) > len(shown):
             print(f"... and {len(changes) - len(shown)} more workload(s) "
                   f"with the same change")
@@ -736,102 +1028,187 @@ def batched(items, size):
         yield items[start:start + size]
 
 
-def send_updates(resolved):
+def send_updates(resolved, batch_size=BULK_UPDATE_LIMIT):
     """Apply label changes, in batches, via the PCE's bulk_update endpoint.
 
     resolved is a list of (change, hrefs). The PCE takes at most
-    BULK_UPDATE_LIMIT workloads per call, so large runs are split into batches.
+    BULK_UPDATE_LIMIT workloads per call, so large runs are split into batches
+    of batch_size, sent MAX_CONCURRENT_REQUESTS at a time.
     """
-    hostname_by_href = {
-        change['workload'].get('href'): change['hostname']
-        for change, _ in resolved
-    }
+    hostname_by_href = {}
+    change_by_href = {}
     payload = []
     for change, hrefs in resolved:
-        item = {'href': change['workload'].get('href')}
+        href = change['workload'].get('href')
+        hostname_by_href[href] = change['hostname']
+        change_by_href[href] = change
+        item = {'href': href}
         if hrefs is not None:
-            item['labels'] = [{'href': href} for href in hrefs]
+            item['labels'] = [{'href': label_href} for label_href in hrefs]
         if change['current_mode'] != change['desired_mode']:
             item['enforcement_mode'] = change['desired_mode']
         payload.append(item)
 
-    bulk_url = f'{base_url}/orgs/{org}/workloads/bulk_update'
-    total_batches = (len(payload) + BULK_UPDATE_LIMIT - 1) // BULK_UPDATE_LIMIT
+    total_batches = (len(payload) + batch_size - 1) // batch_size
+    log.debug('updating %d workload(s) in batches of up to %d',
+              len(payload), batch_size)
     if total_batches > 1:
-        print(f"Updating {len(payload)} workload(s) in {total_batches} batches "
-              f"of up to {BULK_UPDATE_LIMIT}...")
+        print(f"Updating {len(payload)} workload(s) in batches of up to "
+              f"{batch_size}, {MAX_CONCURRENT_REQUESTS} at a time...")
+
+    started = time.monotonic()
+
+    async def work(limiter):
+        state = {'bulk_missing': False, 'size': batch_size,
+                 'writer': limiter, 'serial': False,
+                 'sent': 0, 'total': len(payload),
+                 'progress': total_batches > 1}
+
+        # The first batch goes alone: it shows whether this PCE has
+        # bulk_update at all and how large a batch it will take, before the
+        # rest are sent concurrently at the size that worked.
+        first, rest = payload[:batch_size], payload[batch_size:]
+        results = [await send_batch(limiter, 1, first, hostname_by_href,
+                                    change_by_href, state)]
+        results += await asyncio.gather(*(
+            send_batch(limiter, number, batch, hostname_by_href,
+                       change_by_href, state)
+            for number, batch in enumerate(batched(rest, state['size']), start=2)
+        ))
+        return results
 
     updated = 0
     failures = []  # (hostname, message)
+    for batch_updated, batch_failures in run_async(work):
+        updated += batch_updated
+        failures.extend(batch_failures)
 
-    for number, batch in enumerate(batched(payload, BULK_UPDATE_LIMIT), start=1):
-        response = requests.put(bulk_url, auth=auth, verify=cert_path, json=batch)
-
-        # Older PCEs without bulk_update: fall back to one PUT per workload.
-        if response.status_code in (404, 405):
-            if number == 1:
-                print("  bulk_update unavailable on this PCE, "
-                      "updating workloads individually...")
-            batch_updated, batch_failures = send_updates_individually(
-                batch, hostname_by_href)
-            updated += batch_updated
-            failures.extend(batch_failures)
-            continue
-
-        if response.status_code not in (200, 204):
-            for item in batch:
-                failures.append((
-                    hostname_by_href.get(item['href'], item['href']),
-                    f"batch failed ({response.status_code}) {response.text}",
-                ))
-            continue
-
-        # A 200 carries per-workload results; anything without an error counts
-        # as applied.
-        try:
-            results = response.json()
-        except ValueError:
-            results = []
-
-        if not results:
-            updated += len(batch)
-        else:
-            for result in results:
-                href = result.get('href')
-                hostname = hostname_by_href.get(href, href)
-                errors = result.get('errors') or []
-                if errors or result.get('status') not in (None, 'updated'):
-                    message = '; '.join(
-                        error.get('message', str(error)) for error in errors
-                    ) or str(result.get('status'))
-                    failures.append((hostname, message))
-                else:
-                    updated += 1
-
-        if total_batches > 1:
-            print(f"  batch {number}/{total_batches}: {len(batch)} sent")
+    log.debug('update finished: %d updated, %d failed in %.2fs',
+              updated, len(failures), time.monotonic() - started)
+    for hostname, message in failures:
+        log.debug('failed %s: %s', hostname, message)
 
     report_update_results(resolved, hostname_by_href, updated, failures)
 
 
-def send_updates_individually(batch, hostname_by_href):
-    """One PUT per workload, for PCEs that do not offer bulk_update."""
+def log_batch(number, batch, change_by_href):
+    if not log.isEnabledFor(logging.DEBUG):
+        return
+    for item in batch:
+        change = change_by_href[item['href']]
+        line = f"batch {number}: updating {change['hostname']} ({item['href']})"
+        if 'labels' in item:
+            line += (f": labels {format_labels(change['current_labels'])} -> "
+                     f"{format_labels(change['desired_labels'])}")
+        if 'enforcement_mode' in item:
+            line += (f": enforcement {change['current_mode']} -> "
+                     f"{change['desired_mode']}")
+        log.debug(line)
+
+
+async def send_batch(limiter, number, batch, hostname_by_href, change_by_href,
+                     state, resend=False):
+    """Send one bulk_update batch. Returns (updated, failures)."""
+    if not resend:
+        log_batch(number, batch, change_by_href)
+
+    def fail_all(message):
+        return 0, [(hostname_by_href.get(item['href'], item['href']), message)
+                   for item in batch]
+
+    # Only throttling is retried as it stands; a 5xx is handled below.
+    try:
+        response = await api_call(
+            state['writer'], 'PUT',
+            f'{base_url}/orgs/{org}/workloads/bulk_update',
+            retry_statuses=(429,), json=batch)
+    except requests.RequestException as exc:
+        return fail_all(f"batch failed: {exc}")
+
+    # Older PCEs without bulk_update: fall back to one PUT per workload.
+    if response.status_code in (404, 405):
+        if not state['bulk_missing']:
+            state['bulk_missing'] = True
+            print("  bulk_update unavailable on this PCE, "
+                  "updating workloads individually...")
+        return await send_updates_individually(limiter, batch, hostname_by_href)
+
+    # A 5xx on a large batch is usually the PCE running out of time partway
+    # through, with some of the batch already applied. Every item carries the
+    # workload's complete desired state, so resending is safe: cut the batch
+    # up and send the pieces again.
+    if response.status_code >= 500 and len(batch) > 1:
+        size = max(len(batch) // BATCH_SPLIT, 1)
+        if not state['serial']:
+            state['serial'] = True
+            state['writer'] = asyncio.Semaphore(1)
+        if size < state['size']:
+            state['size'] = size
+            print(f"  the PCE returned {response.status_code} on a batch of "
+                  f"{len(batch)}; resending in batches of {size}, one at a "
+                  f"time...")
+        log.debug('batch %d: %d on %d workload(s), resending in batches of %d',
+                  number, response.status_code, len(batch), size)
+        parts = await asyncio.gather(*(
+            send_batch(limiter, number, part, hostname_by_href, change_by_href,
+                       state, resend=True)
+            for part in batched(batch, size)
+        ))
+        return (sum(updated for updated, _ in parts),
+                [failure for _, failures in parts for failure in failures])
+
+    if response.status_code not in (200, 204):
+        return fail_all(f"batch failed ({response.status_code}) {response.text}")
+
+    # A 200 carries per-workload results; anything without an error counts
+    # as applied.
+    try:
+        results = response.json()
+    except ValueError:
+        results = []
+
     updated = 0
     failures = []
-    for item in batch:
+    if not results:
+        updated = len(batch)
+    else:
+        for result in results:
+            href = result.get('href')
+            hostname = hostname_by_href.get(href, href)
+            errors = result.get('errors') or []
+            if errors or result.get('status') not in (None, 'updated'):
+                message = '; '.join(
+                    error.get('message', str(error)) for error in errors
+                ) or str(result.get('status'))
+                failures.append((hostname, message))
+            else:
+                updated += 1
+
+    state['sent'] += len(batch)
+    log.debug('batch %d: %d updated, %d failed (%d of %d workloads sent)',
+              number, updated, len(failures), state['sent'], state['total'])
+    if state['progress']:
+        print(f"  {state['sent']}/{state['total']} workloads sent")
+    return updated, failures
+
+
+async def send_updates_individually(limiter, batch, hostname_by_href):
+    """One PUT per workload, for PCEs that do not offer bulk_update."""
+    async def put(item):
         hostname = hostname_by_href.get(item['href'], item['href'])
         body = {k: v for k, v in item.items() if k != 'href'}
-        response = requests.put(
-            f"{base_url}{item['href']}",
-            auth=auth,
-            verify=cert_path,
-            json=body,
-        )
+        try:
+            response = await api_call(
+                limiter, 'PUT', f"{base_url}{item['href']}", json=body)
+        except requests.RequestException as exc:
+            return hostname, str(exc)
         if response.status_code in (200, 204):
-            updated += 1
-        else:
-            failures.append((hostname, f"({response.status_code}) {response.text}"))
-    return updated, failures
+            return None
+        return hostname, f"({response.status_code}) {response.text}"
+
+    outcomes = await asyncio.gather(*(put(item) for item in batch))
+    failures = [outcome for outcome in outcomes if outcome]
+    return len(batch) - len(failures), failures
 
 
 def report_update_results(resolved, hostname_by_href, updated, failures):
@@ -852,7 +1229,7 @@ def report_update_results(resolved, hostname_by_href, updated, failures):
 
 
 def apply_label_changes(changes, action, skip_confirm=False, backup=True,
-                        backup_path=None):
+                        backup_path=None, batch_size=BULK_UPDATE_LIMIT):
     if not changes:
         print(f"\nNo label changes to {action}.")
         return
@@ -906,6 +1283,8 @@ def apply_label_changes(changes, action, skip_confirm=False, backup=True,
         if change['current_mode'] != change['desired_mode']:
             line += (f"  [enforcement {change['current_mode']} -> "
                      f"{change['desired_mode']}]")
+        else:
+            line += f"  [enforcement {change['current_mode']}, unchanged]"
         print(line)
     if len(resolved) > MAX_LISTED:
         print(f"  ... and {len(resolved) - MAX_LISTED} more")
@@ -935,7 +1314,7 @@ def apply_label_changes(changes, action, skip_confirm=False, backup=True,
               "saved locally.")
 
     print()
-    send_updates(resolved)
+    send_updates(resolved, batch_size)
 
 
 def main():
@@ -1024,7 +1403,11 @@ def main():
              'same format the backup files use. This happens automatically '
              'before --apply and --rollback; pass this flag to choose the '
              'filename, or on its own to take a snapshot without changing '
-             'anything. Defaults to quarantine-backup.<ddmmyyyy>.<hhmm>.csv.',
+             'anything. Defaults to quarantine-backup.<ddmmyyyy>.<hhmm>.csv. '
+             'With --rollback, a CSV_FILE that already exists is read instead: '
+             'each workload\'s enforcement mode is restored from it, and the '
+             'pre-rollback backup goes to the default filename so the file is '
+             'not overwritten.',
     )
     parser.add_argument(
         '-y', '--yes', '--no-prompt',
@@ -1041,6 +1424,35 @@ def main():
              'cannot be restored from disk.',
     )
 
+    parser.add_argument(
+        '--log-rotate',
+        metavar='N',
+        nargs='?',
+        type=int,
+        const=LOG_ROTATE_DEFAULT,
+        help=f'Rotate the debug log. With --debug, each run starts a fresh '
+             f'log and the previous one moves to a numbered file, as does a '
+             f'log that reaches 10 MB mid-run: {LOG_FILE}.1 is the most recent, '
+             f'then .2, .3 and so on, keeping N of them and deleting the '
+             f'oldest. N defaults to {LOG_ROTATE_DEFAULT}.',
+    )
+    parser.add_argument(
+        '--batch-size',
+        metavar='N',
+        type=int,
+        default=BULK_UPDATE_LIMIT,
+        help=f'How many workloads to send in one bulk_update call, from 1 to '
+             f'{BULK_UPDATE_LIMIT}. Default: {BULK_UPDATE_LIMIT}. Lower it for '
+             f'a PCE that times out on large batches.',
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help=f'Write every API call and every workload being updated to '
+             f'{LOG_FILE}, appended to on each run and archived to a .log.gz '
+             f'beside it at 10 MB. API credentials are never logged.',
+    )
+
     # With no arguments at all, show the full help instead of argparse's
     # one-line "argument --workloads is required" error.
     if len(sys.argv) == 1:
@@ -1048,6 +1460,19 @@ def main():
         return
 
     args = parser.parse_args()
+
+    if not 1 <= args.batch_size <= BULK_UPDATE_LIMIT:
+        parser.error(f'--batch-size must be between 1 and {BULK_UPDATE_LIMIT}, '
+                     f'got: {args.batch_size}')
+
+    if args.log_rotate is not None:
+        if not args.debug:
+            parser.error('--log-rotate rotates the debug log, so it needs --debug')
+        if args.log_rotate < 1:
+            parser.error(f'--log-rotate must be 1 or more, got: {args.log_rotate}')
+
+    if args.debug:
+        print(f"Debug log: {setup_debug_log(rotate=args.log_rotate)}")
 
     label_values = parse_label_args(args.label, parser)
     acting = args.preview or args.apply or args.rollback
@@ -1077,20 +1502,45 @@ def main():
     file_labels = any(target['labels'] for target in targets)
     file_enforcement = any(target['enforcement'] for target in targets)
 
+    # On a rollback, a --backup file that already exists is the record of how
+    # things were, so each host's enforcement mode is restored from it.
+    restore_path = None
+    restore_modes = {}
+    if (args.rollback and args.backup not in (None, True)
+            and os.path.isfile(args.backup)):
+        try:
+            backup_targets = read_workload_targets(args.backup)
+        except ValueError as exc:
+            parser.error(str(exc))
+        restore_path = args.backup
+        restore_modes = {
+            target['hostname']: target['enforcement']
+            for target in backup_targets if target['enforcement']
+        }
+
     if acting and not (args.label or args.enforcement
-                       or file_labels or file_enforcement):
+                       or file_labels or file_enforcement or restore_modes):
         parser.error('--preview, --apply and --rollback require --label VALUE '
                      'and/or --enforcement MODE, or a workloads file carrying '
-                     'label columns and/or an enforcement_mode column')
+                     'label columns and/or an enforcement_mode column, or for '
+                     '--rollback an existing --backup file to restore '
+                     'enforcement modes from')
 
-    # Resolving a value to its key needs the PCE's label list, so it happens
-    # after the connection is configured.
+    log.debug('PCE %s at %s, org %s; %d hostname(s) from %s',
+              PCE_NAME, base_url, org, len(hostnames), args.workloads)
+
+    # Resolving a value to its key needs the PCE's label list, which is fetched
+    # alongside the workloads rather than ahead of them.
+    need_labels = bool(label_values) or bool(acting and file_labels)
+    workloads = fetch_workloads(hostnames, with_labels=need_labels)
+
     labels = resolve_label_values(label_values, parser)
     if acting and file_labels:
         validate_target_labels(targets, parser)
 
-    workloads = fetch_workloads()
     found, missing_hosts = match_workloads(workloads, hostnames)
+    log.debug('%d workload(s) fetched, %d of %d hostname(s) matched',
+              len(workloads), len(found), len(hostnames))
 
     report(found, missing_hosts, len(hostnames), targets_by_host)
 
@@ -1115,8 +1565,31 @@ def main():
                   + (f"; --label {', '.join(sorted(labels.values()))} "
                      f"{'is' if len(labels) == 1 else 'are'} removed."
                      if labels else "."))
+        rollback_targets = targets_by_host
+        if restore_path:
+            # The backup's mode wins over the workloads file's; --enforcement
+            # still wins over both. Hosts the backup does not list are left
+            # as the workloads file has them.
+            rollback_targets = {
+                hostname: dict(
+                    target,
+                    enforcement=restore_modes.get(hostname)
+                    or target['enforcement'])
+                for hostname, target in targets_by_host.items()
+            }
+            covered = sum(1 for hostname, _ in found
+                          if hostname in restore_modes)
+            print(f"\nRestoring enforcement modes from {restore_path}, which "
+                  f"records one for {covered} of {len(found)} workload(s)."
+                  + (f" --enforcement {args.enforcement} overrides it."
+                     if args.enforcement else ""))
+            log.debug('rollback: enforcement modes for %d of %d workload(s) '
+                      'read from %s', covered, len(found), restore_path)
+            # The state before this rollback is backed up to a new file, so
+            # the backup being restored from is not overwritten.
+            backup_path = None
         changes, mismatches = compute_rollback(found, labels, args.enforcement,
-                                               targets_by_host)
+                                               rollback_targets)
         print_label_diff(changes, 'rollback')
         if mismatches:
             print("\nNot removed, the key now holds a different value:")
@@ -1126,7 +1599,8 @@ def main():
                 print(f"  ... and {len(mismatches) - MAX_LISTED} more")
         apply_label_changes(changes, 'rollback', skip_confirm=args.yes,
                             backup=not args.no_backup,
-                            backup_path=backup_path)
+                            backup_path=backup_path,
+                            batch_size=args.batch_size)
         return
 
     changes, replacements = compute_append(found, labels, args.enforcement,
@@ -1142,8 +1616,14 @@ def main():
     if args.apply:
         apply_label_changes(changes, 'apply', skip_confirm=args.yes,
                             backup=not args.no_backup,
-                            backup_path=backup_path)
+                            backup_path=backup_path,
+                            batch_size=args.batch_size)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (PCEError, requests.RequestException) as exc:
+        log.debug('run failed: %s', exc)
+        print(exc)
+        raise SystemExit(1)

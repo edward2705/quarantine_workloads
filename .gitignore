@@ -4,3 +4,6 @@ __pycache__/
 config.yaml
 quarantine-backup.*.csv
 server.crt
+
+# --debug output: names every workload touched
+*.log*
