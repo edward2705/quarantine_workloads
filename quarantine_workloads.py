@@ -193,6 +193,13 @@ RETRY_STATUSES = (429, 502, 503, 504)
 MAX_ATTEMPTS = 5
 MAX_RETRY_DELAY = 30
 
+# The PCE allows an API key a fixed number of requests a minute (500 on the PCE
+# this was measured against) and answers 429 until the minute is up. A
+# throttled call is therefore retried every RATE_LIMIT_WAIT seconds, for up to
+# RATE_LIMIT_PATIENCE, rather than being given up on after a few quick tries.
+RATE_LIMIT_WAIT = 10
+RATE_LIMIT_PATIENCE = 180
+
 # How long to wait for the PCE to finish an async collection job.
 JOB_TIMEOUT = 900
 
@@ -312,7 +319,10 @@ def api_request(method, url, retry_statuses=RETRY_STATUSES, **kwargs):
     elif body is not None:
         detail += f' body={body}'
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    attempt = 0
+    throttled_at = None
+    while True:
+        attempt += 1
         backoff = min(2 ** (attempt - 1), MAX_RETRY_DELAY)
         started = time.monotonic()
         try:
@@ -326,7 +336,7 @@ def api_request(method, url, retry_statuses=RETRY_STATUSES, **kwargs):
             log.debug('%s %s%s -> %s after %.2fs (attempt %d/%d)',
                       method, url, detail, type(exc).__name__,
                       time.monotonic() - started, attempt, MAX_ATTEMPTS)
-            if attempt == MAX_ATTEMPTS:
+            if attempt >= MAX_ATTEMPTS:
                 raise
             time.sleep(backoff)
             continue
@@ -335,6 +345,21 @@ def api_request(method, url, retry_statuses=RETRY_STATUSES, **kwargs):
                   method, url, detail, response.status_code,
                   time.monotonic() - started, len(response.content),
                   attempt, MAX_ATTEMPTS)
+
+        # Being throttled is not a failed attempt: wait for the PCE's window
+        # to reopen and send it again.
+        if response.status_code == 429 and 429 in retry_statuses:
+            if throttled_at is None:
+                throttled_at = started
+            if time.monotonic() - throttled_at < RATE_LIMIT_PATIENCE:
+                wait = retry_delay(response, RATE_LIMIT_WAIT)
+                log.debug('%s %s%s throttled by the PCE, retrying in %ds',
+                          method, url, detail, wait)
+                time.sleep(wait)
+                attempt -= 1
+                continue
+            return response
+
         if response.status_code in retry_statuses and attempt < MAX_ATTEMPTS:
             time.sleep(retry_delay(response, backoff))
             continue

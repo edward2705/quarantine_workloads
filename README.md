@@ -284,9 +284,13 @@ re-fetched on every run.
   debug log shows each split.
   If a PCE always times out at the default, start smaller and skip the wasted
   first attempt: `--batch-size 250`.
-- *Throttling.* A `429`, or a dropped connection, is retried up to 5 times,
-  honouring `Retry-After`; so is a `502`, `503` or `504` on a fetch. Lower
-  `MAX_CONCURRENT_REQUESTS` if the PCE throttles often.
+- *Throttling.* The PCE allows an API key a fixed number of requests a minute
+  (500 on the PCE this was measured against) and answers `429` until the minute
+  is up. A throttled call waits and is sent again every 10 seconds for up to 3
+  minutes, so a run pauses rather than fails. Per-hostname lookups are the main
+  way to reach the limit: more than about 450 hosts in the file means a wait of
+  up to a minute partway through the fetch. A dropped connection, or a `502`,
+  `503` or `504` on a fetch, is retried up to 5 times.
 
 Runs of 20 workloads or fewer name each host; past that, listings are summarised.
 
